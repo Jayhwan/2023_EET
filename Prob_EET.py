@@ -7,14 +7,16 @@ import time
 
 class HyperParameters:
     def __init__(self, hyper_input=None):
-        self.grad_step_size = 0.01
-        self.grad_max_iter = 100
+        self.grad_step_size = 0.005
+        self.grad_max_iter = 50
         self.grad_eps = 1e-4
 
-        self.ve_step_size_leader = 0.5
-        self.ve_step_size_follower = 0.01
-        self.ve_max_iter = 1000
+        self.ve_step_size_leader = 0.3
+        self.ve_step_size_follower = .05
+        self.ve_max_iter = 10
+
         self.ve_eps = 1e-5
+        self.spne_max_iter = 50
         self.active_epsilon = 1e-5
 
         self.prox_gamma = 1
@@ -26,7 +28,7 @@ class EETParameters:
     def __init__(self, eet_input=None):
         self.total_users = 100
         self.active_users = 10
-        self.passive_users = 90
+        self.passive_users = self.total_users - self.active_users
         self.time_horizon = 12
         self.alpha = 0.9956
         self.beta_s = 0.99
@@ -57,8 +59,8 @@ class Leader:
     def update_grad(self, gradient, step_size=0.5):
         self.sell += step_size * gradient[0]
         self.buy += step_size * gradient[1]
-        p_s = cp.Variable(self.time)
-        p_b = cp.Variable(self.time)
+        p_s = cp.Variable(self.time, nonneg=True)
+        p_b = cp.Variable(self.time, nonneg=True)
         obj = cp.Minimize(cp.sum(cp.power(p_s - self.sell, 2) + cp.sum(cp.power(p_b - self.buy, 2))))
         const = [p_s <= p_b]
         prob = cp.Problem(obj, const)
@@ -138,6 +140,24 @@ class EETGame:
         for i in range(self.eet_param.total_users):
             self.all_followers[i].update_direct(next_decisions[i])
 
+    def info_func(self):
+        x_s_all, x_b_all, l_all, x_s_active, x_b_active, l_active = self.followers_action()
+        p_s = self.leader.sell
+        p_b = self.leader.buy
+
+        load = np.sum(l_all, axis=0)
+        par = np.max(load)/np.average(load)
+        ec = -np.sum(np.multiply(self.eet_param.p_e, np.power(load, 2)))
+        l_util = -np.sum(np.multiply(self.eet_param.p_e, np.power(load, 2)))-self.eet_param.p_tax*np.sum(np.power(p_s, 2) + np.power(p_b, 2))
+        f_util_list = []
+        for i in range(self.eet_param.total_users):
+            f_util_list += [np.sum(np.multiply(p_s, x_s_all[i]) - np.multiply(p_b, x_b_all[i]))
+                            - np.sum(np.multiply(self.eet_param.p_e, np.multiply(l_all[i], np.sum(l_all, axis=0))))
+                            - self.eet_param.p_soh*(np.sum(np.multiply(x_s_all[i], np.sum(x_s_all, axis=0))
+                                                           + np.multiply(x_b_all[i], np.sum(x_b_all, axis=0))))]
+
+        return par, ec, l_util, f_util_list
+
     def followers_ve_iter(self, num_iter):
         print("Compute the followers VE")
         p_s, p_b = self.leader_action()
@@ -172,7 +192,7 @@ class EETGame:
                     constraints = [] #= [x_s_var >= np.zeros(self.eet_param.time_horizon), x_b_var >= np.zeros(self.eet_param.time_horizon), l_var >= np.zeros(self.eet_param.time_horizon)]
                     constraints += [x_s_var + np.sum(x_s_active, axis=0) - x_s <= self.eet_param.c_s]
                     constraints += [x_b_var + np.sum(x_b_active, axis=0) - x_b <= self.eet_param.c_b]
-
+                    constraints += [l_var == x_s_var - x_b_var + follower.usage]
                     q_ess = self.eet_param.q_init
                     for t in range(self.eet_param.time_horizon):
                         q_ess = self.eet_param.alpha * q_ess + self.eet_param.beta_s*(x_s_var[t] -x_s[t] + np.sum(x_s_active[:, t])) - self.eet_param.beta_b*(x_b_var[t] - x_b[t] + np.sum(x_b_active[:, t]))
@@ -182,7 +202,6 @@ class EETGame:
                     result = prob.solve(solver='ECOS')
 
                     diff += np.sqrt(np.sum(np.power(x_s_var.value - x_s, 2) + np.power(x_b_var.value - x_b, 2) + np.power(l_var.value - l, 2)))
-
                     follower.update_direct([x_s_var.value, x_b_var.value])
 
             print(f'Iter {iter+1}, Difference of followers action : {diff} / Stopping criterion : {self.hyper_param.ve_eps}')
@@ -346,27 +365,38 @@ class EETGame:
         grad_s = g_s_1 + x[:T]
         grad_b = g_b_1 + x[T:]
 
+        #print(g_s_1, x[:T])
+        #print(g_b_1, x[T:])
+
         #grad_s = g_s_1 + g_s_2 @ g_s_3
         #grad_b = g_b_1 + g_b_2 @ g_b_3
         return grad_s, grad_b
 
     def se_algorithm(self):
         diff = 0
+        par_hist = []
         for iter in range(self.hyper_param.grad_max_iter):
             diff_f = self.followers_ve_iter(num_iter=self.hyper_param.ve_max_iter)
             grad_s, grad_b = self.compute_leader_gradient()
             diff_l = self.leader.update_grad([grad_s, grad_b], self.hyper_param.grad_step_size)
             diff = np.sqrt(diff_f**2 + diff_l**2)
 
+            par, ec, l_util, f_utils = self.info_func()
+
+            par_hist += [par]
+
             print(f'Iter {iter+1}, Difference of follower and leader action : {diff} / Stopping criterion : {self.hyper_param.ve_eps}')
+            #print(self.leader.sell, self.leader.buy)
+            print(f'PAR History {par_hist}')
             if diff <= self.hyper_param.ve_eps:
                 break
 
-        return diff
+        return diff, par_hist
 
     def spne_algorithm(self, fix_leader=True):
         diff = 0
-        for iter in range(self.hyper_param.ve_max_iter):
+        par_hist = []
+        for iter in range(self.hyper_param.spne_max_iter):
             if fix_leader:
                 self.leader.update_direct([np.zeros(self.eet_param.time_horizon), np.zeros(self.eet_param.time_horizon)])
                 diff_l = 0
@@ -381,16 +411,29 @@ class EETGame:
 
             diff = np.sqrt(diff_l**2 + diff_f**2)
 
+            par, ec, l_util, f_utils = self.info_func()
+
+            par_hist += [par]
             print(f'Iter {iter+1}, Difference of follower and leader action : {diff} / Stopping criterion : {self.hyper_param.ve_eps}')
+            print(f'PAR History {par_hist}')
             if diff <= self.hyper_param.ve_eps:
                 break
 
-        return diff
+        return diff, par_hist
 
 
 if __name__=="__main__":
     load = np.load("./data/load_123.npy", allow_pickle=True)[:, 6:18]
     pv = np.load("./data/E_PV.npy", allow_pickle=True)[6:18]
-    game = EETGame(load, pv)
-    game.compute_leader_gradient()
-#    game.spne_algorithm()
+    game_se = EETGame(load, pv)
+    game_spne = EETGame(load, pv)
+    #game.compute_leader_gradient()
+    _, par_se = game_se.se_algorithm()
+    _, par_spne = game_spne.spne_algorithm(fix_leader=False) # 2.5278279782256923
+
+    plt.figure()
+    plt.plot(par_se, color='r', label='Stackelberg Equilibrium')
+    plt.plot(par_spne, color='k', label='Subgame Perfect Nash Equilibrium')
+    plt.legend()
+    plt.show()
+

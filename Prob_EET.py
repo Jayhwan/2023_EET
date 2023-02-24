@@ -66,6 +66,8 @@ class Leader:
         self.sell = p_s.value
         self.buy = p_b.value
 
+        return step_size * np.linalg.norm(np.concatenate([gradient[0], gradient[1]]))
+
     def update_direct(self, next_decision):
         [self.sell, self.buy] = next_decision
 
@@ -128,7 +130,7 @@ class EETGame:
         for i , follower in enumerate(self.passive_followers, start=self.eet_param.active_users):
             x_s[i] = follower.sell
             x_b[i] = follower.buy
-            l = follower.load
+            l[i] = follower.load
 
         return x_s, x_b, l, x_s_active, x_b_active, l_active
 
@@ -212,23 +214,6 @@ class EETGame:
         active = np.hstack((f(x_nm).reshape(-1), f(x_m).reshape(-1), f(z_nm).reshape(-1), f(z_m).reshape(-1), f(x_nm_mu).reshape(-1), f(x_m_mu).reshape(-1)))
         return active
 
-    def compute_leader_gradient(self):
-        x_s_all, x_b_all, l_all, x_s_active, x_b_active, l_active = self.followers_action()
-        g_s_1 = -2*self.eet_param.p_tax*self.leader.sell
-        g_b_1 = -2*self.eet_param.p_tax*self.leader.buy
-
-        g_s_2 = -2*np.multiply(self.eet_param.p_e, np.sum(l_all, axis=0))
-        g_b_2 = 2*np.multiply(self.eet_param.p_e, np.sum(l_all, axis=0))
-
-        #h = (self.eet_param.p_e[0] + self.eet_param.p_soh)
-
-        g_s_3 = np.random.random((self.eet_param.time_horizon, self.eet_param.time_horizon))
-        g_b_3 = np.random.random((self.eet_param.time_horizon, self.eet_param.time_horizon))
-
-        grad_s = g_s_1 + g_s_2 @ g_s_3
-        grad_b = g_b_1 + g_b_2 @ g_b_3
-        return grad_s, grad_b
-
     def compute_leader_gradient_direct(self):
         print("Computing Gradient")
         dest = self.followers_action()
@@ -258,10 +243,7 @@ class EETGame:
 
         Dxh_wave = Dxh
         Dyh_wave = Dyh
-        for i in range(len(active)):
-            if active[i]:
-                Dxh_wave = np.vstack((Dxh_wave, Dxg[i]))
-                Dyh_wave = np.vstack((Dyh_wave, Dyg[i]))
+
         #print(Dyh_wave.shape, Dxh_wave.shape)
 
         s = time.time()
@@ -315,7 +297,6 @@ class EETGame:
         print("Sum Time :", a+b)
         return diff1, diff2
 
-
     def grad_iterations(self):
         if self.grad_history.updated_cnt:
             self.leader.update_direct(self.grad_history.leader_decision_history[-1])
@@ -342,8 +323,46 @@ class EETGame:
         self.save_data()
         return 0
 
+    def compute_leader_gradient(self):
+        x_s_all, x_b_all, l_all, x_s_active, x_b_active, l_active = self.followers_action()
+        g_s_1 = -2*self.eet_param.p_tax*self.leader.sell
+        g_b_1 = -2*self.eet_param.p_tax*self.leader.buy
+
+        g_s_2 = -2*np.multiply(self.eet_param.p_e, np.sum(l_all, axis=0))
+        g_b_2 = 2*np.multiply(self.eet_param.p_e, np.sum(l_all, axis=0))
+
+        T = self.eet_param.time_horizon
+
+        H = np.zeros((4 * T, 4 * T))
+
+        H[:2 * T, : 2 * T] = -2 * np.ones((2 * T, 2 * T)) - (self.eet_param.active_users + 3) * np.eye(2 * T)
+        H[2 * T:, : 2 * T] = (self.eet_param.active_users + 1) * np.eye(2 * T)
+        H[:2 * T, 2 * T:] = (self.eet_param.active_users + 1) * np.eye(2 * T)
+
+        B = np.kron(np.array([1, 0, 0, -1, 1, 0, 0, 1]).reshape(4, 2), np.eye(T))
+
+        x = np.concatenate([g_s_2, g_b_2])@((-np.linalg.inv(H)@B)[:2 * T, :])
+
+        grad_s = g_s_1 + x[:T]
+        grad_b = g_b_1 + x[T:]
+
+        #grad_s = g_s_1 + g_s_2 @ g_s_3
+        #grad_b = g_b_1 + g_b_2 @ g_b_3
+        return grad_s, grad_b
+
     def se_algorithm(self):
-        return 0
+        diff = 0
+        for iter in range(self.hyper_param.grad_max_iter):
+            diff_f = self.followers_ve_iter(num_iter=self.hyper_param.ve_max_iter)
+            grad_s, grad_b = self.compute_leader_gradient()
+            diff_l = self.leader.update_grad([grad_s, grad_b], self.hyper_param.grad_step_size)
+            diff = np.sqrt(diff_f**2 + diff_l**2)
+
+            print(f'Iter {iter+1}, Difference of follower and leader action : {diff} / Stopping criterion : {self.hyper_param.ve_eps}')
+            if diff <= self.hyper_param.ve_eps:
+                break
+
+        return diff
 
     def spne_algorithm(self, fix_leader=True):
         diff = 0
@@ -373,4 +392,5 @@ if __name__=="__main__":
     load = np.load("./data/load_123.npy", allow_pickle=True)[:, 6:18]
     pv = np.load("./data/E_PV.npy", allow_pickle=True)[6:18]
     game = EETGame(load, pv)
-    game.spne_algorithm()
+    game.compute_leader_gradient()
+#    game.spne_algorithm()

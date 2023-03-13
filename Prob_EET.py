@@ -6,14 +6,14 @@ import time
 
 
 class HyperParameters:
-    def __init__(self, hyper_input=None):
-        self.grad_step_size = 0.005
+    def __init__(self, hyper_input={}):
+        self.grad_step_size = 0.0005
         self.grad_max_iter = 50
         self.grad_eps = 1e-4
 
         self.ve_step_size_leader = 0.3
         self.ve_step_size_follower = .05
-        self.ve_max_iter = 10
+        self.ve_max_iter = 50
 
         self.ve_eps = 1e-5
         self.spne_max_iter = 50
@@ -25,11 +25,11 @@ class HyperParameters:
 
 
 class EETParameters:
-    def __init__(self, eet_input=None):
-        self.total_users = 100
-        self.active_users = 10
+    def __init__(self, eet_input={}):
+        self.total_users = eet_input.get('total_users', 20)
+        self.active_users = eet_input.get('active_users', 10)
         self.passive_users = self.total_users - self.active_users
-        self.time_horizon = 12
+        self.time_horizon = eet_input.get('time_horizon', 12)
         self.alpha = 0.9956
         self.beta_s = 0.99
         self.beta_b = 1.01
@@ -46,7 +46,7 @@ class EETParameters:
 
 
 class Leader:
-    def __init__(self, initial_decision=None, time_horizon=12):
+    def __init__(self, initial_decision=None, time_horizon=24):
         # initial_decision = [self.sell, self.buy]
         self.time = time_horizon
         if initial_decision is None:
@@ -75,7 +75,7 @@ class Leader:
 
 
 class Follower:
-    def __init__(self, energy_use, is_active=True, time_horizon=12):
+    def __init__(self, energy_use, is_active=True, time_horizon=24):
         self.usage = energy_use
         assert len(self.usage)==time_horizon
         self.active = is_active
@@ -100,14 +100,14 @@ class EETGame:
         self.hyper_param = HyperParameters(hyper_input)
         self.eet_param = EETParameters(eet_input)
 
-        self.leader = Leader()
+        self.leader = Leader(time_horizon=self.eet_param.time_horizon)
         self.active_followers = []
         self.passive_followers = []
         self.usage_matrix = e_ha_matrix - e_pv_matrix
         for i in range(self.eet_param.active_users):
-            self.active_followers += [Follower(energy_use = self.usage_matrix[i], is_active=True)]
+            self.active_followers += [Follower(energy_use = self.usage_matrix[i], is_active=True, time_horizon=self.eet_param.time_horizon)]
         for i in range(self.eet_param.active_users, self.eet_param.total_users):
-            self.passive_followers += [Follower(energy_use = self.usage_matrix[i], is_active=False)]
+            self.passive_followers += [Follower(energy_use = self.usage_matrix[i], is_active=False, time_horizon=self.eet_param.time_horizon)]
 
         self.all_followers = [*self.active_followers, *self.passive_followers]
 
@@ -147,7 +147,7 @@ class EETGame:
 
         load = np.sum(l_all, axis=0)
         par = np.max(load)/np.average(load)
-        ec = -np.sum(np.multiply(self.eet_param.p_e, np.power(load, 2)))
+        ec = np.sum(np.multiply(self.eet_param.p_e, np.power(load, 2)))
         l_util = -np.sum(np.multiply(self.eet_param.p_e, np.power(load, 2)))-self.eet_param.p_tax*np.sum(np.power(p_s, 2) + np.power(p_b, 2))
         f_util_list = []
         for i in range(self.eet_param.total_users):
@@ -163,8 +163,75 @@ class EETGame:
         p_s, p_b = self.leader_action()
         diff = 0
 
+        load_curve = []
+
         for iter in range(num_iter):
             diff = 0
+
+            x_s_all, x_b_all, l_all, x_s_active, x_b_active, l_active = self.followers_action()
+            """
+            for follower in self.all_followers:
+                if not follower.active:
+                      continue
+                else:
+                    x_s = follower.sell
+                    x_b = follower.buy
+                    l = follower.load
+
+
+                    grad_s = p_s - np.multiply(self.eet_param.p_e, l + np.sum(l_all, axis=0)) - self.eet_param.p_soh * (
+                                x_s + np.sum(x_s_active, axis=0))
+                    grad_b = -p_b + np.multiply(self.eet_param.p_e,
+                                                l + np.sum(l_all, axis=0)) - self.eet_param.p_soh * (
+                                         x_b + np.sum(x_b_active, axis=0))
+
+                    # Gradient Update
+                    x_s_next = x_s + self.hyper_param.ve_step_size_follower * grad_s
+                    x_b_next = x_b + self.hyper_param.ve_step_size_follower * grad_b
+                    #l_next = x_s_next - x_b_next + follower.usage
+
+                    follower.update_direct([x_s_next, x_b_next])
+
+            #print(np.sum(l_all, axis=0))
+            x_s_all, x_b_all, l_all, x_s_active, x_b_active, l_active = self.followers_action()
+
+            #print(np.sum(l_all, axis=0))
+            x_s_var = cp.Variable((self.eet_param.total_users, self.eet_param.time_horizon), nonneg=True)
+            x_b_var = cp.Variable((self.eet_param.total_users, self.eet_param.time_horizon), nonneg=True)
+            l_var = cp.Variable((self.eet_param.total_users, self.eet_param.time_horizon), nonneg=True)
+
+            obj = cp.Minimize(cp.sum(cp.power(x_s_var - x_s_all, 2) + cp.power(x_b_var - x_b_all, 2) + cp.power(l_var - l_all, 2)))
+
+            constraints = []
+            constraints += [cp.sum(x_s_var, axis=0) <= self.eet_param.c_s]
+            constraints += [cp.sum(x_b_var, axis=0) <= self.eet_param.c_b]
+
+            for i, follower in enumerate(self.all_followers):
+                if not follower.active:
+                    constraints += [l_var[i] == follower.usage]
+                    constraints += [x_s_var[i] == 0, x_b_var[i] == 0]
+                else:
+                    constraints += [l_var[i] == x_s_var[i] - x_b_var[i] + follower.usage]
+
+            q_ess = self.eet_param.q_init
+            for t in range(self.eet_param.time_horizon):
+                q_ess = self.eet_param.alpha * q_ess + self.eet_param.beta_s * (cp.sum(x_s_var[:, t])) - self.eet_param.beta_b * (cp.sum(x_b_var[:, t]))
+                constraints += [q_ess >= self.eet_param.q_min, q_ess <= self.eet_param.q_max]
+
+            prob = cp.Problem(obj, constraints)
+            result = prob.solve(solver='ECOS')
+
+            diff = np.sqrt(np.sum(np.power(x_s_var.value - x_s_all, 2) + np.power(x_b_var.value - x_b_all, 2) + np.power(l_var.value - l_all, 2)))
+
+            for i, follower in enumerate(self.all_followers):
+                if not follower.active:
+                    continue
+                else:
+                    #print("XS : ", x_s_var.value[i], "\nXB", x_b_var.value[i], "\nL", l_var.value[i], "\n", follower.usage)
+                    follower.update_direct([x_s_var.value[i], x_b_var.value[i]])
+                    #print("LOAD :", follower.load)
+            """
+
             for follower in self.all_followers:
                 if not follower.active:
                     continue
@@ -204,9 +271,79 @@ class EETGame:
                     diff += np.sqrt(np.sum(np.power(x_s_var.value - x_s, 2) + np.power(x_b_var.value - x_b, 2) + np.power(l_var.value - l, 2)))
                     follower.update_direct([x_s_var.value, x_b_var.value])
 
+            x_s_all, x_b_all, l_all, x_s_active, x_b_active, l_active = self.followers_action()
+            #load_curve += [np.sum(l_all, axis=0)]
             print(f'Iter {iter+1}, Difference of followers action : {diff} / Stopping criterion : {self.hyper_param.ve_eps}')
             if diff <= self.hyper_param.ve_eps:
                 break
+        #plt.figure()
+        #for i, c in enumerate(load_curve):
+        #    plt.plot(c, label=str(i+1))
+        #plt.legend()
+        #plt.show()
+        return diff
+
+    def followers_indiv_ve_iter(self, num_iter):
+        print("Compute the followers VE")
+        p_s, p_b = self.leader_action()
+        diff = 0
+
+        load_curve = []
+
+        for iter in range(num_iter):
+            diff = 0
+
+            x_s_all, x_b_all, l_all, x_s_active, x_b_active, l_active = self.followers_action()
+
+            for follower in self.all_followers:
+                if not follower.active:
+                    continue
+                else:
+                    x_s_all, x_b_all, l_all, x_s_active, x_b_active, l_active = self.followers_action()
+
+                    x_s = follower.sell
+                    x_b = follower.buy
+                    l = follower.load
+
+                    grad_s = p_s - np.multiply(self.eet_param.p_e, l + np.sum(l_all, axis=0)) - self.eet_param.p_soh*(x_s + np.sum(x_s_active, axis=0))
+                    grad_b = -p_b + np.multiply(self.eet_param.p_e, l + np.sum(l_all, axis=0)) - self.eet_param.p_soh*(x_b + np.sum(x_b_active, axis=0))
+
+                    # Gradient Update
+                    x_s_next = x_s + self.hyper_param.ve_step_size_follower * grad_s
+                    x_b_next = x_b + self.hyper_param.ve_step_size_follower * grad_b
+                    l_next = x_s_next - x_b_next + follower.usage
+
+                    # Projection
+                    x_s_var = cp.Variable(self.eet_param.time_horizon, nonneg=True)
+                    x_b_var = cp.Variable(self.eet_param.time_horizon, nonneg=True)
+                    l_var = cp.Variable(self.eet_param.time_horizon, nonneg=True)
+
+                    obj = cp.Minimize(cp.sum(cp.power(x_s_var - x_s_next, 2) + cp.power(x_b_var - x_b_next, 2) + cp.power(l_var - l_next, 2)))
+                    constraints = [] #= [x_s_var >= np.zeros(self.eet_param.time_horizon), x_b_var >= np.zeros(self.eet_param.time_horizon), l_var >= np.zeros(self.eet_param.time_horizon)]
+                    constraints += [x_s_var <= self.eet_param.c_s/self.eet_param.active_users]
+                    constraints += [x_b_var <= self.eet_param.c_b/self.eet_param.active_users]
+                    constraints += [l_var == x_s_var - x_b_var + follower.usage]
+                    q_ess = 0. # self.eet_param.q_init
+                    for t in range(self.eet_param.time_horizon):
+                        q_ess = self.eet_param.alpha * q_ess + self.eet_param.beta_s*(x_s_var[t]) - self.eet_param.beta_b*(x_b_var[t])
+                        constraints += [q_ess >= self.eet_param.q_min/self.eet_param.active_users, q_ess <= self.eet_param.q_max/self.eet_param.active_users]
+
+                    prob = cp.Problem(obj, constraints)
+                    result = prob.solve(solver='ECOS')
+
+                    diff += np.sqrt(np.sum(np.power(x_s_var.value - x_s, 2) + np.power(x_b_var.value - x_b, 2) + np.power(l_var.value - l, 2)))
+                    follower.update_direct([x_s_var.value, x_b_var.value])
+
+            #x_s_all, x_b_all, l_all, x_s_active, x_b_active, l_active = self.followers_action()
+            #load_curve += [np.sum(l_all, axis=0)]
+            print(f'Iter {iter+1}, Difference of followers action : {diff} / Stopping criterion : {self.hyper_param.ve_eps}')
+            if diff <= self.hyper_param.ve_eps:
+                break
+        #plt.figure()
+        #for i, c in enumerate(load_curve):
+        #    plt.plot(c, label=str(i+1))
+        #plt.legend()
+        #plt.show()
         return diff
 
     def inequality_const_value(self):
@@ -347,23 +484,32 @@ class EETGame:
         g_s_1 = -2*self.eet_param.p_tax*self.leader.sell
         g_b_1 = -2*self.eet_param.p_tax*self.leader.buy
 
-        g_s_2 = -2*np.multiply(self.eet_param.p_e, np.sum(l_all, axis=0))
-        g_b_2 = 2*np.multiply(self.eet_param.p_e, np.sum(l_all, axis=0))
+        #g_s_2 = -2*np.multiply(self.eet_param.p_e, np.sum(l_all, axis=0))
+        #g_b_2 = 2*np.multiply(self.eet_param.p_e, np.sum(l_all, axis=0))
 
         T = self.eet_param.time_horizon
 
-        H = np.zeros((4 * T, 4 * T))
+        e_soh = self.eet_param.p_e[0] + self.eet_param.p_soh
+        e = self.eet_param.p_e[0]
 
-        H[:2 * T, : 2 * T] = -2 * np.ones((2 * T, 2 * T)) - (self.eet_param.active_users + 3) * np.eye(2 * T)
-        H[2 * T:, : 2 * T] = (self.eet_param.active_users + 1) * np.eye(2 * T)
-        H[:2 * T, 2 * T:] = (self.eet_param.active_users + 1) * np.eye(2 * T)
 
-        B = np.kron(np.array([1, 0, 0, -1, 1, 0, 0, 1]).reshape(4, 2), np.eye(T))
+        block_h = np.kron(np.kron(np.array([[-2, 1], [1, 0]]), np.array(([[e_soh, -e], [-e, e_soh]]))), np.eye(self.eet_param.active_users)+np.ones((self.eet_param.active_users,self.eet_param.active_users)))
+        block_inv_h = np.linalg.inv(block_h)
+        inv_h = np.kron(np.eye(T), block_inv_h)
 
-        x = np.concatenate([g_s_2, g_b_2])@((-np.linalg.inv(H)@B)[:2 * T, :])
+        b = np.kron(np.eye(T), np.kron(np.array([[1, 0], [0, -1], [-1, 0], [0, 1]]), np.ones((self.eet_param.active_users, 1))))
 
-        grad_s = g_s_1 + x[:T]
-        grad_b = g_b_1 + x[T:]
+        grad_FL = -inv_h@b
+        tmp_grad_s = np.zeros(T)
+        tmp_grad_b = np.zeros(T)
+
+        l = np.sum(l_all, axis=0)
+        for i in range(T):
+            tmp_grad_s[i] = np.kron(l, np.kron(np.array([-2, 2, 0, 0]), np.ones(self.eet_param.active_users)))@grad_FL[:, 2*i].reshape((-1, 1))
+            tmp_grad_b[i] = np.kron(l, np.kron(np.array([-2, 2, 0, 0]), np.ones(self.eet_param.active_users)))@grad_FL[:, 2*i+1].reshape((-1, 1))
+
+        grad_s = g_s_1 + tmp_grad_s
+        grad_b = g_b_1 + tmp_grad_b
 
         #print(g_s_1, x[:T])
         #print(g_b_1, x[T:])
@@ -375,6 +521,7 @@ class EETGame:
     def se_algorithm(self):
         diff = 0
         par_hist = []
+        ec_hist = []
         for iter in range(self.hyper_param.grad_max_iter):
             diff_f = self.followers_ve_iter(num_iter=self.hyper_param.ve_max_iter)
             grad_s, grad_b = self.compute_leader_gradient()
@@ -384,18 +531,19 @@ class EETGame:
             par, ec, l_util, f_utils = self.info_func()
 
             par_hist += [par]
-
+            ec_hist += [ec]
             print(f'Iter {iter+1}, Difference of follower and leader action : {diff} / Stopping criterion : {self.hyper_param.ve_eps}')
             #print(self.leader.sell, self.leader.buy)
             print(f'PAR History {par_hist}')
             if diff <= self.hyper_param.ve_eps:
                 break
 
-        return diff, par_hist
+        return diff, par_hist, ec_hist
 
     def spne_algorithm(self, fix_leader=True):
         diff = 0
         par_hist = []
+        ec_hist = []
         for iter in range(self.hyper_param.spne_max_iter):
             if fix_leader:
                 self.leader.update_direct([np.zeros(self.eet_param.time_horizon), np.zeros(self.eet_param.time_horizon)])
@@ -414,26 +562,137 @@ class EETGame:
             par, ec, l_util, f_utils = self.info_func()
 
             par_hist += [par]
+            ec_hist += [ec]
             print(f'Iter {iter+1}, Difference of follower and leader action : {diff} / Stopping criterion : {self.hyper_param.ve_eps}')
             print(f'PAR History {par_hist}')
             if diff <= self.hyper_param.ve_eps:
                 break
 
-        return diff, par_hist
+        return diff, par_hist, ec_hist
 
+    def indiv_spne_algorithm(self, fix_leader=True):
+        diff = 0
+        par_hist = []
+        ec_hist = []
+        for iter in range(self.hyper_param.spne_max_iter):
+            if fix_leader:
+                self.leader.update_direct([np.zeros(self.eet_param.time_horizon), np.zeros(self.eet_param.time_horizon)])
+                diff_l = 0
+            else:
+                p_s = self.leader.sell
+                p_b = self.leader.buy
+                ratio = (1-2*self.hyper_param.ve_step_size_leader*self.eet_param.p_tax)
+                diff_l = ratio * np.linalg.norm(np.concatenate([p_s, p_b]))
+                self.leader.update_direct([ratio*p_s, ratio*p_b])
+
+            diff_f = self.followers_indiv_ve_iter(num_iter=1)
+
+            diff = np.sqrt(diff_l**2 + diff_f**2)
+
+            par, ec, l_util, f_utils = self.info_func()
+
+            par_hist += [par]
+            ec_hist += [ec]
+            print(f'Iter {iter+1}, Difference of follower and leader action : {diff} / Stopping criterion : {self.hyper_param.ve_eps}')
+            print(f'PAR History {par_hist}')
+            if diff <= self.hyper_param.ve_eps:
+                break
+
+        return diff, par_hist, ec_hist
 
 if __name__=="__main__":
-    load = np.load("./data/load_123.npy", allow_pickle=True)[:, 6:18]
-    pv = np.load("./data/E_PV.npy", allow_pickle=True)[6:18]
-    game_se = EETGame(load, pv)
-    game_spne = EETGame(load, pv)
-    #game.compute_leader_gradient()
-    _, par_se = game_se.se_algorithm()
-    _, par_spne = game_spne.spne_algorithm(fix_leader=False) # 2.5278279782256923
+    load = np.load("./data/load_123.npy", allow_pickle=True)[:, :24]
+    pv = np.load("./data/E_PV.npy", allow_pickle=True)[:24]
 
-    plt.figure()
-    plt.plot(par_se, color='r', label='Stackelberg Equilibrium')
-    plt.plot(par_spne, color='k', label='Subgame Perfect Nash Equilibrium')
-    plt.legend()
+    par_se_list = []
+    par_spne_list = []
+    par_indiv_list = []
+    ec_se_list = []
+    ec_spne_list = []
+    ec_indiv_list = []
+    #np.save("par_data.npy", [par_se_list, par_spne_list])
+    #np.save("./result/par_data_indiv.npy", par_indiv_list)#[par_se_list, par_spne_list])
+    for i in range(1, 100):
+        eet_input = {'total_users': 100,
+                     'active_users': i,
+                     'time_horizon': 24, }
+        game_se = EETGame(load, pv, eet_input=eet_input)
+        game_spne = EETGame(load, pv, eet_input=eet_input)
+        #game_indiv = EETGame(load, pv, eet_input=eet_input)
+        #game_se.followers_ve_iter(num_iter=5)
+        #print(game_se.compute_leader_gradient())
+
+        _, par_se, ec_se = game_se.se_algorithm()
+        _, par_spne, ec_spne = game_spne.spne_algorithm(fix_leader=False) # 2.5278279782256923
+        #_, par_indiv, ec_indiv = game_indiv.indiv_spne_algorithm(fix_leader=False)
+
+        plt.figure()
+        plt.plot(par_se+[par_se[-1] for _ in range(len(par_spne)-len(par_se))], color='r', label='Stackelberg Equilibrium')
+        plt.plot(par_spne, color='k', label='Subgame Perfect Nash Equilibrium')
+        plt.legend()
+        #plt.savefig(f'./result/par_user_{str(i)}')
+        plt.show(block=False)
+        plt.pause(5)
+        plt.close()
+
+        plt.figure()
+        plt.plot(ec_se + [ec_se[-1] for _ in range(len(par_spne) - len(par_se))], color='r',
+                 label='Stackelberg Equilibrium')
+        plt.plot(ec_spne, color='k', label='Subgame Perfect Nash Equilibrium')
+        plt.legend()
+        #plt.savefig(f'./result/ec_user_{str(i)}')
+        plt.show(block=False)
+        plt.pause(5)
+        plt.close()
+
+        #plt.figure()
+        #plt.plot(par_indiv, color='k', label='Subgame Perfect Nash Equilibrium(Individiual)')
+        #plt.legend()
+        #plt.savefig(f'./result/user_{str(i)}_indiv')
+        #plt.show(block=False)
+        #plt.pause(5)
+        #plt.close()
+
+        par_se_list += [min(par_se)]
+        par_spne_list += [par_spne[-1]]
+
+        ec_se_list += [min(ec_se)]
+        ec_spne_list += [ec_spne[-1]]
+        #par_indiv_list += [par_indiv[-1]]
+
+
+        print("SE PAR :", [ '%.4f' % elem for elem in par_se_list])
+        print("SPNE PAR :", ['%.4f' % elem for elem in par_spne_list])
+        print("SE EC :", ['%.4f' % elem for elem in ec_se_list])
+        print("SPNE EC :", ['%.4f' % elem for elem in ec_spne_list])
+
+        #print("Individual SPNE PAR :", ['%.4f' % elem for elem in par_spne_list])
+    np.save("./result/par_data.npy", [par_se_list, par_spne_list])
+    np.save("./result/ec_data.npy", [ec_se_list, ec_spne_list])
+    #np.save("./result/par_data_indiv.npy", par_indiv_list)
+
+    plt.figure(figsize=(10, 6), dpi=300)
+    plt.plot(par_se_list, color='r', label='Stackelberg Equilibrium')
+    plt.plot(par_spne_list, color='k', label='Subgame Perfect Nash Equilibrium')
+
+    # plt.plot(z, label='Subgame Perfect Nash Equilibrium (Individual)')
+    plt.xlabel("Number of Active Users", fontsize=20)
+    plt.ylabel("PAR", fontsize=20)
+    plt.xticks([0, 5, 10, 15, 20], fontsize=20)
+    plt.yticks(fontsize=20)
+    plt.legend(fontsize=20)
+    #plt.savefig(f'./result/1_active_users', bbox_inches='tight')
     plt.show()
 
+    plt.figure(figsize=(10, 6), dpi=300)
+    plt.plot(ec_se_list, color='r', label='Stackelberg Equilibrium')
+    plt.plot(ec_spne_list, color='k', label='Subgame Perfect Nash Equilibrium')
+
+    # plt.plot(z, label='Subgame Perfect Nash Equilibrium (Individual)')
+    plt.xlabel("Number of Active Users", fontsize=20)
+    plt.ylabel("EC", fontsize=20)
+    plt.xticks([0, 5, 10, 15, 20], fontsize=20)
+    plt.yticks(fontsize=20)
+    plt.legend(fontsize=20)
+    #plt.savefig(f'./result/1_active_users', bbox_inches='tight')
+    plt.show()
